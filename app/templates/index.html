@@ -20,13 +20,17 @@
 
         <div class="query-section">
             <h2>Ask Questions</h2>
+            <p class="hint">Try: "What is the credit decision for customer?" or "credit decision" to evaluate customers from the vector store.</p>
             <textarea id="question-input" placeholder="Enter your question..."></textarea>
             <button id="submit-question">Ask</button>
         </div>
 
         <div class="response-section">
             <h2>Response</h2>
+            <div id="response-type-badge" class="badge" style="display:none;"></div>
             <div id="response-content"></div>
+            <div id="decision-card" class="decision-card" style="display:none;"></div>
+            <div id="sources-info" class="sources-info" style="display:none;"></div>
         </div>
     </div>
 
@@ -54,22 +58,109 @@
         });
 
         document.getElementById('submit-question').addEventListener('click', async () => {
-            const question = document.getElementById('question-input').value;
-            
+            const question = document.getElementById('question-input').value.trim();
+            if (!question) return;
+
+            const responseContent = document.getElementById('response-content');
+            const decisionCard = document.getElementById('decision-card');
+            const sourcesInfo = document.getElementById('sources-info');
+            const typeBadge = document.getElementById('response-type-badge');
+
+            // Reset
+            responseContent.textContent = 'Searching...';
+            decisionCard.style.display = 'none';
+            sourcesInfo.style.display = 'none';
+            typeBadge.style.display = 'none';
+
             try {
                 const response = await fetch('/query', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ question })
                 });
                 const result = await response.json();
-                document.getElementById('response-content').textContent = 
-                    result.response || result.error;
+
+                if (result.error) {
+                    responseContent.textContent = 'Error: ' + result.error;
+                    return;
+                }
+
+                // Show response type badge
+                typeBadge.style.display = 'inline-block';
+                typeBadge.className = 'badge badge-' + (result.type || 'llm_only');
+                const typeLabels = {
+                    'credit_decision': 'Credit Decision Engine',
+                    'vector_search': 'Vector Store Search',
+                    'llm_only': 'LLM Response'
+                };
+                typeBadge.textContent = typeLabels[result.type] || result.type;
+
+                // Show text response
+                responseContent.textContent = result.response || '';
+
+                // If credit decision, render the decision card
+                if (result.type === 'credit_decision' && result.decision) {
+                    const d = result.decision;
+                    const isApproved = d.decision.decisionCode === 'APPROVED';
+                    const isRefer = d.decision.decisionCode === 'REFER';
+
+                    let cardClass = 'declined';
+                    if (isApproved) cardClass = 'approved';
+                    if (isRefer) cardClass = 'refer';
+
+                    let html = `<div class="decision-result ${cardClass}">`;
+                    html += `<div class="decision-header">`;
+                    html += `<span class="decision-code">${d.decision.decisionCode}</span>`;
+                    html += `<span class="decision-desc">${d.decision.decisionDescription}</span>`;
+                    html += `</div>`;
+
+                    html += `<div class="decision-details">`;
+                    html += `<div class="detail-row"><strong>Risk Score:</strong> ${d.risk.riskScore}</div>`;
+                    html += `<div class="detail-row"><strong>Risk Band:</strong> <span class="risk-${d.risk.riskBand.toLowerCase()}">${d.risk.riskBand}</span></div>`;
+
+                    if (isApproved) {
+                        html += `<div class="detail-row"><strong>Credit Limit:</strong> ₹${d.decision.creditLimit?.toLocaleString() || 'N/A'}</div>`;
+                        html += `<div class="detail-row"><strong>Interest Rate:</strong> ${d.decision.interestRate || 'N/A'}%</div>`;
+                        html += `<div class="detail-row"><strong>Tenure:</strong> ${d.decision.tenureMonths || 'N/A'} months</div>`;
+                    }
+                    html += `</div>`;
+
+                    html += `<div class="reason-codes"><strong>Reason Codes:</strong><ul>`;
+                    for (const rc of d.reasonCodes || []) {
+                        html += `<li><code>${rc.code}</code> — ${rc.description}</li>`;
+                    }
+                    html += `</ul></div>`;
+
+                    html += `<div class="request-id">Request: ${d.header.requestId}</div>`;
+                    html += `</div>`;
+
+                    // Show available customers if present
+                    if (result.available_customers) {
+                        html += `<div class="available-customers"><strong>Available customers:</strong> ${result.available_customers.join(', ')}</div>`;
+                    }
+
+                    decisionCard.innerHTML = html;
+                    decisionCard.style.display = 'block';
+                }
+
+                // Show sources if vector search
+                if (result.type === 'vector_search' && result.sources) {
+                    const uniqueSources = [...new Set(result.sources)];
+                    sourcesInfo.innerHTML = `<strong>Sources:</strong> ${uniqueSources.join(', ')} (${result.chunks_found} chunks matched)`;
+                    sourcesInfo.style.display = 'block';
+                }
+
             } catch (error) {
                 console.error('Error:', error);
-                alert('Error getting response');
+                responseContent.textContent = 'Error getting response';
+            }
+        });
+
+        // Allow Enter key to submit (Shift+Enter for newline)
+        document.getElementById('question-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                document.getElementById('submit-question').click();
             }
         });
     </script>

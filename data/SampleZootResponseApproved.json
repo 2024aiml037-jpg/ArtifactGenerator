@@ -1,0 +1,27 @@
+{
+  "header": {
+    "requestId": "REQ-20260404-000790",
+    "responseTimestamp": "2026-04-04T08:22:10Z"
+  },
+  "decision": {
+    "decisionCode": "APPROVED",
+    "decisionDescription": "Approved",
+    "creditLimit": 500000,
+    "interestRate": 11.5,
+    "tenureMonths": 36
+  },
+  "risk": {
+    "riskScore": 312,
+    "riskBand": "LOW"
+  },
+  "reasonCodes": [
+    {
+      "code": "Z001",
+      "description": "Strong bureau score"
+    },
+    {
+      "code": "Z014",
+      "description": "Income sufficient for requested amount"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "header": {
+    "requestId": "REQ-20260404-000789",
+    "responseTimestamp": "2026-04-04T08:20:15Z"
+  },
+  "decision": {
+    "decisionCode": "DECLINED",
+    "decisionDescription": "Declined"
+  },
+  "risk": {
+    "riskScore": 845,
+    "riskBand": "HIGH"
+  },
+  "reasonCodes": [
+    {
+      "code": "Z062",
+      "description": "High debt-to-income ratio"
+    },
+    {
+      "code": "Z071",
+      "description": "Low bureau score"
+    }
+  ]
+}

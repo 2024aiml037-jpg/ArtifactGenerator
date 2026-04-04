@@ -1,0 +1,24 @@
+{
+  "header": {
+    "requestId": "REQ-20260404-000456",
+    "responseTimestamp": "2026-04-04T08:16:30Z"
+  },
+  "decision": {
+    "decisionCode": "REFER",
+    "decisionDescription": "Manual Review Required"
+  },
+  "risk": {
+    "riskScore": 625,
+    "riskBand": "MEDIUM"
+  },
+  "reasonCodes": [
+    {
+      "code": "Z023",
+      "description": "Thin credit file"
+    },
+    {
+      "code": "Z045",
+      "description": "Recent delinquency observed"
+    }
+  ]
+}

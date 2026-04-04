@@ -12,6 +12,7 @@ pydantic==1.10.16
 networkx==3.2.1
 sentence-transformers==2.2.2
 python-docx==0.8.11
+openpyxl==3.1.5
 atlassian-python-api==3.41.0
 sqlalchemy==2.0.20
 prometheus-client==0.17.1
