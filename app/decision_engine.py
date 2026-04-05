@@ -27,15 +27,18 @@ DTI_THRESHOLD = 0.50
 
 class CreditDecisionEngine:
     """Applies Zoot business rules to customer data to produce credit decisions.
-    Integrates with Vector Store for request storage and rule retrieval."""
+    Integrates with Vector Store (for non-JSON rules) and Knowledge Graph DB
+    (for JSON requests/responses) for storage and retrieval."""
 
-    def __init__(self, data_dir: str, vector_store=None, ingestion_layer=None):
+    def __init__(self, data_dir: str, vector_store=None, ingestion_layer=None,
+                 knowledge_graph=None):
         self.data_dir = data_dir
         self.vector_store = vector_store
         self.ingestion_layer = ingestion_layer
+        self.knowledge_graph = knowledge_graph
         self.customer_requests: Dict[str, Dict] = {}
         self._load_customer_data()
-        self._ingest_rules_to_vector_store()
+        self._ingest_rules_to_stores()
 
     def _load_customer_data(self):
         """Load all Zoot request JSON files from data/ and index by customerId"""
@@ -60,13 +63,20 @@ class CreditDecisionEngine:
 
         logger.info(f"Loaded {len(self.customer_requests)} customer request(s)")
 
-    def _ingest_rules_to_vector_store(self):
-        """Ingest ZootRules.xlsx and sample response templates into vector store at startup"""
-        if not self.vector_store or not self.ingestion_layer:
+    def _ingest_rules_to_stores(self):
+        """Ingest rules and templates into appropriate stores at startup.
+        
+        Routing:
+          - ZootRules.xlsx -> Vector Store (non-JSON)
+          - JSON response templates -> Knowledge Graph DB
+          - JSON customer requests -> Knowledge Graph DB
+        """
+        if not self.ingestion_layer:
             return
 
+        # XLSX rules -> Vector Store
         rules_path = os.path.join(self.data_dir, 'ZootRules.xlsx')
-        if os.path.exists(rules_path):
+        if os.path.exists(rules_path) and self.vector_store:
             try:
                 rules_doc = self.ingestion_layer.ingest_file(rules_path)
                 self.vector_store.add_text_chunks(
@@ -77,21 +87,34 @@ class CreditDecisionEngine:
             except Exception as e:
                 logger.error(f"Failed to ingest ZootRules.xlsx: {e}")
 
-        # Ingest sample response templates so they can be retrieved as reference
+        # JSON response templates -> Knowledge Graph DB
         for filename in ['SampleZootResponseApproved.json', 'SampleZootResponseDecline.json', 'SampleZootResponseRefer.json']:
             fpath = os.path.join(self.data_dir, filename)
             if os.path.exists(fpath):
                 try:
+                    with open(fpath, 'r') as f:
+                        json_data = json.load(f)
                     resp_doc = self.ingestion_layer.ingest_file(fpath)
-                    self.vector_store.add_text_chunks(
-                        resp_doc.chunks,
-                        metadatas=[{'source': filename, 'type': 'zoot_response_template'} for _ in resp_doc.chunks]
-                    )
-                    logger.info(f"Ingested {filename}: {len(resp_doc.chunks)} chunks")
+                    # Store in Knowledge Graph if available
+                    if self.knowledge_graph:
+                        self.knowledge_graph.ingest_json_document(
+                            doc_id=resp_doc.document_id,
+                            filename=filename,
+                            data=json_data,
+                            metadata={'source': filename, 'type': 'zoot_response_template'}
+                        )
+                        logger.info(f"Ingested {filename} into Knowledge Graph")
+                    elif self.vector_store:
+                        # Fallback: store in vector store
+                        self.vector_store.add_text_chunks(
+                            resp_doc.chunks,
+                            metadatas=[{'source': filename, 'type': 'zoot_response_template'} for _ in resp_doc.chunks]
+                        )
+                        logger.info(f"Ingested {filename}: {len(resp_doc.chunks)} chunks into vector store (KG unavailable)")
                 except Exception as e:
                     logger.debug(f"Skipping {filename}: {e}")
 
-        # Also ingest all known customer requests
+        # JSON customer requests -> Knowledge Graph DB
         for cid, req_data in self.customer_requests.items():
             self.ingest_request(req_data)
 
@@ -110,45 +133,60 @@ class CreditDecisionEngine:
 
     def find_customer_ids_in_vector_store(self, k: int = 20) -> List[str]:
         """
-        Search the vector store for all customer IDs stored in zoot_request chunks.
+        Search the Vector Store and Knowledge Graph for all customer IDs.
 
         Returns:
-            List of unique customer IDs found in the vector store
+            List of unique customer IDs found across both stores
         """
-        if not self.vector_store:
-            return []
+        found_ids = []
+        import re
 
-        try:
-            results = self.vector_store.similarity_search("customerId applicant individual", k=k)
-            found_ids = []
-            import re
-            for doc in results:
-                # Check metadata first
-                cid = doc.metadata.get('customer_id', '')
-                if cid and cid.startswith('CI') and cid not in found_ids:
-                    found_ids.append(cid)
-                    continue
-                # Fallback: parse from content
-                for m in re.finditer(r'"customerId"\s*:\s*"(CI\d+)"', doc.page_content):
-                    c = m.group(1)
-                    if c not in found_ids:
-                        found_ids.append(c)
-            return found_ids
-        except Exception as e:
-            logger.error(f"Error searching vector store for customer IDs: {e}")
-            return []
+        # Search Knowledge Graph first (JSON documents stored here)
+        if self.knowledge_graph:
+            try:
+                kg_results = self.knowledge_graph.search_json_documents(
+                    "customerId applicant individual", k=k
+                )
+                for r in kg_results:
+                    for m in re.finditer(r'"customerId"\s*:\s*"(CI\d+)"', r.get('text', '')):
+                        c = m.group(1)
+                        if c not in found_ids:
+                            found_ids.append(c)
+            except Exception as e:
+                logger.error(f"Error searching Knowledge Graph for customer IDs: {e}")
 
-    # ---- Vector Store Integration ----
+        # Also search Vector Store (fallback / additional)
+        if self.vector_store:
+            try:
+                results = self.vector_store.similarity_search("customerId applicant individual", k=k)
+                for doc in results:
+                    # Check metadata first
+                    cid = doc.metadata.get('customer_id', '')
+                    if cid and cid.startswith('CI') and cid not in found_ids:
+                        found_ids.append(cid)
+                        continue
+                    # Fallback: parse from content
+                    for m in re.finditer(r'"customerId"\s*:\s*"(CI\d+)"', doc.page_content):
+                        c = m.group(1)
+                        if c not in found_ids:
+                            found_ids.append(c)
+            except Exception as e:
+                logger.error(f"Error searching Vector Store for customer IDs: {e}")
+
+        return found_ids
+
+    # ---- Storage Integration ----
 
     def ingest_request(self, request_data: Dict) -> Dict:
         """
-        Ingest a Zoot request into the vector store, chunked by section.
+        Ingest a Zoot request into the Knowledge Graph DB (JSON data)
+        and optionally into the Vector Store as fallback.
 
         Args:
             request_data: Full Zoot request dict
 
         Returns:
-            Ingestion summary with chunk count and doc IDs
+            Ingestion summary with storage location and details
         """
         customer_id = (request_data.get('applicant') or {}).get('customerId', 'unknown')
 
@@ -156,49 +194,66 @@ class CreditDecisionEngine:
         if customer_id != 'unknown':
             self.customer_requests[customer_id] = request_data
 
-        if not self.vector_store:
-            logger.warning("No vector store configured; request indexed in memory only")
-            return {'customer_id': customer_id, 'stored_in_vector_db': False, 'chunks': 0}
-
-        # Build chunks: one per top-level section (mirrors ingestion_layer JSON chunking)
-        chunks = []
-        metadatas = []
-        for key, value in request_data.items():
-            chunk_text = f"[{key}]: {json.dumps(value, indent=2)}"
-            chunks.append(chunk_text)
-            metadatas.append({
-                'source': f'ZootRequest_{customer_id}',
-                'section': key,
+        # Primary: Store JSON request in Knowledge Graph DB
+        if self.knowledge_graph:
+            doc_id = f"zoot_req_{customer_id}_{int(datetime.utcnow().timestamp())}"
+            kg_result = self.knowledge_graph.ingest_json_document(
+                doc_id=doc_id,
+                filename=f'ZootRequest_{customer_id}.json',
+                data=request_data,
+                metadata={
+                    'customer_id': customer_id,
+                    'type': 'zoot_request',
+                    'timestamp': datetime.utcnow().isoformat()
+                }
+            )
+            logger.info(f"Ingested request for {customer_id} into Knowledge Graph: {kg_result['total_nodes']} nodes")
+            return {
                 'customer_id': customer_id,
-                'type': 'zoot_request',
-                'timestamp': datetime.utcnow().isoformat()
-            })
+                'stored_in': 'knowledge_graph',
+                'total_nodes': kg_result['total_nodes'],
+                'document_id': doc_id
+            }
 
-        doc_ids = self.vector_store.add_text_chunks(chunks, metadatas=metadatas)
-        logger.info(f"Ingested request for {customer_id}: {len(doc_ids)} chunks stored in vector DB")
+        # Fallback: Store in Vector Store if Knowledge Graph is unavailable
+        if self.vector_store:
+            chunks = []
+            metadatas = []
+            for key, value in request_data.items():
+                chunk_text = f"[{key}]: {json.dumps(value, indent=2)}"
+                chunks.append(chunk_text)
+                metadatas.append({
+                    'source': f'ZootRequest_{customer_id}',
+                    'section': key,
+                    'customer_id': customer_id,
+                    'type': 'zoot_request',
+                    'timestamp': datetime.utcnow().isoformat()
+                })
 
-        return {
-            'customer_id': customer_id,
-            'stored_in_vector_db': True,
-            'chunks': len(doc_ids),
-            'doc_ids': doc_ids
-        }
+            doc_ids = self.vector_store.add_text_chunks(chunks, metadatas=metadatas)
+            logger.info(f"Ingested request for {customer_id} into Vector Store (KG unavailable): {len(doc_ids)} chunks")
+            return {
+                'customer_id': customer_id,
+                'stored_in': 'vector_store',
+                'chunks': len(doc_ids),
+                'doc_ids': doc_ids
+            }
+
+        logger.warning("No storage configured; request indexed in memory only")
+        return {'customer_id': customer_id, 'stored_in': 'memory_only', 'chunks': 0}
 
     def retrieve_rules(self, request_data: Dict, k: int = 5) -> List[str]:
         """
-        Retrieve relevant Zoot rules from the vector store based on request context.
+        Retrieve relevant Zoot rules from the Vector Store and Knowledge Graph
+        based on request context.
 
         Args:
             request_data: The Zoot request dict (used to build the search query)
-            k: Number of rule chunks to retrieve
+            k: Number of rule chunks to retrieve per store
 
         Returns:
-            List of matched rule text chunks from the vector store
+            List of matched rule text chunks from both stores
         """
-        if not self.vector_store:
-            logger.warning("No vector store configured; using built-in rules")
-            return []
-
         bureau_score = (request_data.get('bureauData') or {}).get('bureauScore', 0)
         annual_income = (request_data.get('financials') or {}).get('annualIncome', 0)
         obligations = (request_data.get('financials') or {}).get('existingObligations', 0)
@@ -209,22 +264,40 @@ class CreditDecisionEngine:
             f"obligations {obligations} approved declined refer risk"
         )
 
-        try:
-            results = self.vector_store.similarity_search(query, k=k)
-            rule_texts = [doc.page_content for doc in results]
-            logger.info(f"Retrieved {len(rule_texts)} rule chunks from vector store")
-            return rule_texts
-        except Exception as e:
-            logger.error(f"Error retrieving rules from vector store: {e}")
-            return []
+        rule_texts = []
+
+        # Search Vector Store (XLSX rules, non-JSON content)
+        if self.vector_store:
+            try:
+                results = self.vector_store.similarity_search(query, k=k)
+                rule_texts.extend([doc.page_content for doc in results])
+                logger.info(f"Retrieved {len(results)} rule chunks from Vector Store")
+            except Exception as e:
+                logger.error(f"Error retrieving rules from Vector Store: {e}")
+
+        # Search Knowledge Graph (JSON templates, response examples)
+        if self.knowledge_graph:
+            try:
+                kg_results = self.knowledge_graph.search_json_documents(query, k=k)
+                kg_texts = [r['text'] for r in kg_results]
+                rule_texts.extend(kg_texts)
+                logger.info(f"Retrieved {len(kg_results)} rule chunks from Knowledge Graph")
+            except Exception as e:
+                logger.error(f"Error retrieving rules from Knowledge Graph: {e}")
+
+        if not rule_texts:
+            logger.warning("No rules found in either store; using built-in rules")
+
+        return rule_texts
 
     # ---- Evaluation ----
 
     def evaluate(self, customer_id: str) -> Dict:
         """
         Evaluate credit decision for a customer based on Zoot Rules.
-        Ingests the request into the vector store, retrieves matching rules,
-        applies them, and returns the decision response.
+        Ingests the request into Knowledge Graph DB, retrieves matching rules
+        from both Vector Store and Knowledge Graph, applies them, and returns
+        the decision response.
 
         Args:
             customer_id: The customer ID to look up
@@ -239,14 +312,14 @@ class CreditDecisionEngine:
             available = vs_customer_ids or list(self.customer_requests.keys())
             available_str = ', '.join(available) if available else 'none'
             raise ValueError(
-                f"Customer ID '{customer_id}' not found in vector store. "
+                f"Customer ID '{customer_id}' not found in Knowledge Graph or Vector Store. "
                 f"Available customer IDs: {available_str}"
             )
 
-        # Step 1: Ingest request into vector store
+        # Step 1: Ingest request into Knowledge Graph (or Vector Store fallback)
         ingestion_info = self.ingest_request(request_data)
 
-        # Step 2: Retrieve matching rules from vector store
+        # Step 2: Retrieve matching rules from both Vector Store and Knowledge Graph
         matched_rules = self.retrieve_rules(request_data)
 
         # Step 3: Apply rules to determine decision
@@ -257,14 +330,15 @@ class CreditDecisionEngine:
             'traceability': {
                 'ingestion': ingestion_info,
                 'matched_rules': matched_rules[:5],
-                'rules_source': 'vector_store' if matched_rules else 'built_in'
+                'rules_source': 'vector_store+knowledge_graph' if matched_rules else 'built_in'
             }
         }
 
     def evaluate_request(self, request_data: Dict) -> Dict:
         """
         Evaluate credit decision for an ad-hoc Zoot request payload.
-        Ingests the request, retrieves rules, applies them, returns response.
+        Ingests the request into Knowledge Graph, retrieves rules from both
+        stores, applies them, returns response.
 
         Args:
             request_data: Zoot-format request dict
@@ -272,10 +346,10 @@ class CreditDecisionEngine:
         Returns:
             Dict with 'response' (Zoot format) and 'traceability' (internal)
         """
-        # Step 1: Ingest into vector store
+        # Step 1: Ingest into Knowledge Graph (or Vector Store fallback)
         ingestion_info = self.ingest_request(request_data)
 
-        # Step 2: Retrieve matching rules
+        # Step 2: Retrieve matching rules from both stores
         matched_rules = self.retrieve_rules(request_data)
 
         # Step 3: Apply rules
@@ -286,7 +360,7 @@ class CreditDecisionEngine:
             'traceability': {
                 'ingestion': ingestion_info,
                 'matched_rules': matched_rules[:5],
-                'rules_source': 'vector_store' if matched_rules else 'built_in'
+                'rules_source': 'vector_store+knowledge_graph' if matched_rules else 'built_in'
             }
         }
 

@@ -59,7 +59,10 @@ feedback_loop = FeedbackLoop() if Config.ENABLE_FEEDBACK_LOOP else None
 
 # Initialize credit decision engine
 data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
-decision_engine = CreditDecisionEngine(data_dir, vector_store=vector_store, ingestion_layer=ingestion_layer)
+decision_engine = CreditDecisionEngine(
+    data_dir, vector_store=vector_store,
+    ingestion_layer=ingestion_layer, knowledge_graph=knowledge_graph
+)
 
 # Pipeline state tracker
 pipeline_state = {
@@ -146,9 +149,32 @@ def upload_document():
             # Store ingested document for pipeline
             pipeline_state['ingested_document'] = ingested_doc
             
-            # Add to vector store
-            vector_store.add_text_chunks(ingested_doc.chunks)
-            logger.debug("Document chunks added to vector store")
+            # Route storage by file type:
+            # JSON files -> Knowledge Graph DB
+            # Other files -> Vector Store
+            stored_in = None
+            if file_ext == '.json':
+                # Store JSON in Knowledge Graph
+                if knowledge_graph:
+                    import json as json_mod
+                    file.seek(0)
+                    json_data = json_mod.loads(file.read().decode('utf-8'))
+                    kg_result = knowledge_graph.ingest_json_document(
+                        doc_id=ingested_doc.document_id,
+                        filename=file.filename,
+                        data=json_data
+                    )
+                    stored_in = 'knowledge_graph'
+                    logger.debug(f"JSON document stored in Knowledge Graph: {kg_result['total_nodes']} nodes")
+                else:
+                    # Fallback to vector store if KG is disabled
+                    vector_store.add_text_chunks(ingested_doc.chunks)
+                    stored_in = 'vector_store'
+            else:
+                # Non-JSON files -> Vector Store
+                vector_store.add_text_chunks(ingested_doc.chunks)
+                stored_in = 'vector_store'
+                logger.debug("Document chunks added to vector store")
             
             observability.record_ingestion(
                 source_type=str(ingested_doc.metadata.source),
@@ -161,6 +187,7 @@ def upload_document():
                 'message': 'Document ingested successfully',
                 'document_id': ingested_doc.document_id,
                 'chunks_processed': len(ingested_doc.chunks),
+                'stored_in': stored_in,
                 'metadata': {
                     'source': ingested_doc.metadata.source.value,
                     'filename': ingested_doc.metadata.filename,
@@ -201,6 +228,7 @@ def ingest_sample_data():
             
             ingested_docs = []
             all_chunks = []
+            kg_ingested = []
             
             for filename in zoot_files + optional_files:
                 file_path = os.path.join(data_dir, filename)
@@ -214,11 +242,31 @@ def ingest_sample_data():
                 ingested_docs.append(ingested_doc)
                 all_chunks.extend(ingested_doc.chunks)
                 
-                # Store to vector DB
-                vector_store.add_text_chunks(
-                    ingested_doc.chunks,
-                    metadatas=[{'source': filename, 'document_id': ingested_doc.document_id} for _ in ingested_doc.chunks]
-                )
+                file_ext = os.path.splitext(filename)[1].lower()
+                
+                # Route by file type: JSON -> Knowledge Graph, Others -> Vector Store
+                if file_ext == '.json' and knowledge_graph:
+                    import json as json_mod
+                    with open(file_path, 'r') as jf:
+                        json_data = json_mod.load(jf)
+                    kg_result = knowledge_graph.ingest_json_document(
+                        doc_id=ingested_doc.document_id,
+                        filename=filename,
+                        data=json_data,
+                        metadata={'source': filename, 'document_id': ingested_doc.document_id}
+                    )
+                    kg_ingested.append({
+                        'filename': filename,
+                        'stored_in': 'knowledge_graph',
+                        'total_nodes': kg_result['total_nodes']
+                    })
+                    logger.info(f"JSON '{filename}' stored in Knowledge Graph: {kg_result['total_nodes']} nodes")
+                else:
+                    # Non-JSON files -> Vector Store
+                    vector_store.add_text_chunks(
+                        ingested_doc.chunks,
+                        metadatas=[{'source': filename, 'document_id': ingested_doc.document_id} for _ in ingested_doc.chunks]
+                    )
                 
                 observability.record_ingestion(
                     source_type=str(ingested_doc.metadata.source),
@@ -247,17 +295,22 @@ def ingest_sample_data():
             
             results = []
             for doc in ingested_docs:
+                file_ext = os.path.splitext(doc.metadata.filename or '')[1].lower()
+                stored_in = 'knowledge_graph' if (file_ext == '.json' and knowledge_graph) else 'vector_store'
                 results.append({
                     'document_id': doc.document_id,
                     'filename': doc.metadata.filename,
                     'source_type': doc.metadata.source.value,
                     'chunks_stored': len(doc.chunks),
+                    'stored_in': stored_in,
                     'content_preview': doc.content[:300]
                 })
             
             return jsonify({
-                'message': f'Successfully ingested {len(ingested_docs)} Zoot data files into Vector DB',
+                'message': f'Successfully ingested {len(ingested_docs)} Zoot data files',
+                'storage_routing': 'JSON files -> Knowledge Graph DB, Other files -> Vector Store',
                 'total_chunks_in_vector_db': len(all_chunks),
+                'knowledge_graph_documents': kg_ingested,
                 'combined_document_id': pipeline_state['current_document_id'],
                 'documents': results,
                 'next_steps': ['/api/pipeline/run', '/api/extract']
@@ -845,8 +898,8 @@ def query():
     """
     Smart query endpoint:
     1. If credit decision query with customer ID -> decision engine
-    2. Search vector store for relevant context
-    3. Use LLM with vector store context to answer
+    2. Search vector store AND Knowledge Graph DB for relevant context
+    3. Use LLM with vector store and knowledge graph context to answer
     """
     data = request.json
     if 'question' not in data:
@@ -898,31 +951,48 @@ def query():
                 })
             else:
                 return jsonify({
-                    'response': 'No customer IDs found in vector store. Please ingest customer data first.',
+                    'response': 'No customer IDs found in stores. Please ingest customer data first.',
                     'type': 'credit_decision_error',
                     'available_customers': []
                 }), 404
 
-        # --- Route 2: Vector store search + LLM ---
+        # --- Route 2: Vector store + Knowledge Graph search + LLM ---
         vector_results = vector_store.similarity_search(question, k=5)
         context_chunks = [doc.page_content for doc in vector_results]
+        vector_sources = [doc.metadata.get('source', 'unknown') for doc in vector_results]
 
-        if context_chunks:
-            # Build context-augmented prompt
-            context_text = "\n\n---\n\n".join(context_chunks)
+        # Also search the Knowledge Graph for JSON document context
+        kg_results = []
+        kg_context_chunks = []
+        if knowledge_graph:
+            kg_results = knowledge_graph.search_json_documents(question, k=5)
+            kg_context_chunks = [r['text'] for r in kg_results]
+
+        # Combine context from both stores
+        all_context = context_chunks + kg_context_chunks
+        all_sources = vector_sources + [r.get('filename', 'knowledge_graph') for r in kg_results]
+
+        if all_context:
+            # Build context-augmented prompt from both stores
+            vs_context = "\n\n---\n\n".join(context_chunks) if context_chunks else "(no results)"
+            kg_context = "\n\n---\n\n".join(kg_context_chunks) if kg_context_chunks else "(no results)"
             augmented_prompt = (
-                f"Use the following context from the knowledge base to answer the question. "
+                f"Use the following context from two knowledge stores to answer the question. "
                 f"If the context doesn't contain relevant information, say so.\n\n"
-                f"Context:\n{context_text}\n\n"
+                f"=== Vector Store Context ===\n{vs_context}\n\n"
+                f"=== Knowledge Graph Context ===\n{kg_context}\n\n"
                 f"Question: {question}"
             )
+            print(f"Augmented Prompt:\n{augmented_prompt}\n{'='*50}")
             llm_response = llm_service.llm.predict(input=augmented_prompt)
-
+            print(f"LLM Response:\n{llm_response}\n{'='*50}")
             return jsonify({
                 'response': llm_response,
-                'type': 'vector_search',
-                'sources': [doc.metadata.get('source', 'unknown') for doc in vector_results],
-                'chunks_found': len(context_chunks)
+                'type': 'dual_store_search',
+                'sources': all_sources,
+                'vector_store_chunks': len(context_chunks),
+                'knowledge_graph_chunks': len(kg_context_chunks),
+                'chunks_found': len(all_context)
             })
         else:
             # No vector results — plain LLM
@@ -1038,8 +1108,8 @@ def get_credit_decision(customer_id):
         vs_ids = decision_engine.find_customer_ids_in_vector_store()
         available = vs_ids or decision_engine.get_customer_ids()
         return jsonify({
-            'error': f"Customer ID '{customer_id}' not found in vector store.",
-            'message': 'Customer ID not found. Please provide a valid customer ID from the vector store.',
+            'error': f"Customer ID '{customer_id}' not found.",
+            'message': 'Customer ID not found. Please provide a valid customer ID.',
             'available_customers': available
         }), 404
     except Exception as e:

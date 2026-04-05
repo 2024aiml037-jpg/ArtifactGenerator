@@ -1,10 +1,14 @@
 """
 Knowledge Graph - Builds and manages relationships between entities
+Also serves as the primary store for JSON documents (structured data),
+while non-JSON files are stored in the Vector Store.
 """
 
 import logging
 from typing import List, Dict, Set, Optional, Tuple
 import json
+import re
+from datetime import datetime
 
 import networkx as nx
 
@@ -16,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeGraph:
-    """Manages the knowledge graph with entities and relationships"""
+    """Manages the knowledge graph with entities and relationships.
+    
+    Also stores ingested JSON documents as graph nodes with section-based
+    relationships, enabling structured search alongside entity relationships.
+    """
 
     def __init__(self):
         """Initialize a directed graph for knowledge representation"""
@@ -25,9 +33,205 @@ class KnowledgeGraph:
         self.edges: Dict[str, KnowledgeGraphEdge] = {}
         self.node_counter = 0
         self.edge_counter = 0
+        # JSON document storage: tracks ingested JSON docs and their node IDs
+        self.json_documents: Dict[str, Dict] = {}  # doc_id -> {filename, root_node_id, node_ids}
+
+    # ==================== JSON Document Storage ====================
+
+    def ingest_json_document(self, doc_id: str, filename: str, data: dict,
+                             metadata: Optional[Dict] = None) -> Dict:
+        """
+        Ingest a JSON document into the knowledge graph as structured nodes.
+        Each top-level key becomes a node; nested objects become child nodes
+        linked by 'part_of' relationships.
+
+        Args:
+            doc_id: Unique document ID
+            filename: Source filename
+            data: Parsed JSON data (dict)
+            metadata: Optional extra metadata
+
+        Returns:
+            Summary dict with root_node_id and total nodes created
+        """
+        node_ids = []
+        meta = metadata or {}
+        meta.update({'source_file': filename, 'document_id': doc_id,
+                     'ingested_at': datetime.utcnow().isoformat()})
+
+        # Create a root document node
+        root_node_id = f"json_root_{self.node_counter}"
+        self.node_counter += 1
+        root_node = KnowledgeGraphNode(
+            node_id=root_node_id,
+            entity_id=doc_id,
+            node_type=EntityType.ENTITY,
+            properties={
+                'text': f"JSON Document: {filename}",
+                'filename': filename,
+                'node_kind': 'json_root',
+                **meta
+            }
+        )
+        self.nodes[root_node_id] = root_node
+        self.graph.add_node(root_node_id, **root_node.dict())
+        node_ids.append(root_node_id)
+
+        # Recursively add sections
+        self._add_json_sections(data, root_node_id, filename, doc_id, node_ids, depth=0)
+
+        self.json_documents[doc_id] = {
+            'filename': filename,
+            'root_node_id': root_node_id,
+            'node_ids': node_ids,
+            'metadata': meta
+        }
+
+        logger.info(f"Ingested JSON '{filename}' into knowledge graph: "
+                     f"{len(node_ids)} nodes created (doc_id={doc_id})")
+        return {
+            'document_id': doc_id,
+            'root_node_id': root_node_id,
+            'total_nodes': len(node_ids),
+            'stored_in': 'knowledge_graph'
+        }
+
+    def _add_json_sections(self, data, parent_node_id: str, filename: str,
+                           doc_id: str, node_ids: list, depth: int):
+        """Recursively add JSON sections as child nodes linked to parent"""
+        if depth > 5:
+            return  # safety limit
+
+        items = []
+        if isinstance(data, dict):
+            items = list(data.items())
+        elif isinstance(data, list):
+            items = [(f"item_{i}", v) for i, v in enumerate(data)]
+        else:
+            return
+
+        for key, value in items:
+            section_node_id = f"json_sec_{self.node_counter}"
+            self.node_counter += 1
+
+            # Build a human-readable text for the section
+            if isinstance(value, (dict, list)):
+                text = f"[{key}]: {json.dumps(value, indent=2)}"
+            else:
+                text = f"[{key}]: {value}"
+
+            section_node = KnowledgeGraphNode(
+                node_id=section_node_id,
+                entity_id=f"{doc_id}_{key}",
+                node_type=EntityType.ENTITY,
+                properties={
+                    'text': text,
+                    'section_key': key,
+                    'filename': filename,
+                    'document_id': doc_id,
+                    'node_kind': 'json_section',
+                    'depth': depth
+                }
+            )
+            self.nodes[section_node_id] = section_node
+            self.graph.add_node(section_node_id, **section_node.dict())
+            node_ids.append(section_node_id)
+
+            # Link to parent with 'part_of' relationship
+            edge_id = f"edge_{self.edge_counter}"
+            self.edge_counter += 1
+            edge = KnowledgeGraphEdge(
+                edge_id=edge_id,
+                source_node_id=section_node_id,
+                target_node_id=parent_node_id,
+                relationship_type='part_of',
+                strength=1.0,
+                metadata={'document_id': doc_id}
+            )
+            self.edges[edge_id] = edge
+            self.graph.add_edge(section_node_id, parent_node_id,
+                                relation='part_of', strength=1.0, edge_id=edge_id)
+
+            # Recurse into nested dicts/lists
+            if isinstance(value, (dict, list)):
+                self._add_json_sections(value, section_node_id, filename,
+                                        doc_id, node_ids, depth + 1)
+
+    def search_json_documents(self, query: str, k: int = 5) -> List[Dict]:
+        """
+        Search JSON documents stored in the knowledge graph using keyword matching.
+        Returns the most relevant node texts and metadata.
+
+        Args:
+            query: Search query string
+            k: Maximum number of results
+
+        Returns:
+            List of dicts with 'text', 'node_id', 'filename', 'score'
+        """
+        query_lower = query.lower()
+        query_terms = set(re.split(r'\W+', query_lower)) - {'', 'the', 'a', 'an', 'is', 'of', 'for', 'in', 'to'}
+
+        scored_results = []
+        for node_id, node in self.nodes.items():
+            node_kind = node.properties.get('node_kind', '')
+            if node_kind not in ('json_section', 'json_root'):
+                continue
+
+            text = node.properties.get('text', '')
+            text_lower = text.lower()
+
+            # Score by term overlap
+            score = sum(1 for term in query_terms if term in text_lower)
+            if score > 0:
+                scored_results.append({
+                    'text': text,
+                    'node_id': node_id,
+                    'entity_id': node.entity_id,
+                    'filename': node.properties.get('filename', 'unknown'),
+                    'section_key': node.properties.get('section_key', ''),
+                    'document_id': node.properties.get('document_id', ''),
+                    'score': score
+                })
+
+        # Sort by score descending, return top k
+        scored_results.sort(key=lambda x: x['score'], reverse=True)
+        return scored_results[:k]
+
+    def get_json_document_nodes(self, doc_id: str) -> List[Dict]:
+        """Get all nodes for a specific JSON document"""
+        doc_info = self.json_documents.get(doc_id)
+        if not doc_info:
+            return []
+
+        results = []
+        for nid in doc_info['node_ids']:
+            node = self.nodes.get(nid)
+            if node:
+                results.append({
+                    'node_id': nid,
+                    'entity_id': node.entity_id,
+                    'text': node.properties.get('text', ''),
+                    'section_key': node.properties.get('section_key', ''),
+                })
+        return results
+
+    def get_json_documents_list(self) -> List[Dict]:
+        """List all ingested JSON documents"""
+        return [
+            {
+                'document_id': doc_id,
+                'filename': info['filename'],
+                'total_nodes': len(info['node_ids']),
+                'root_node_id': info['root_node_id']
+            }
+            for doc_id, info in self.json_documents.items()
+        ]
+
+    # ==================== Entity Management ====================
 
     def add_entities(self, entities: List[NormalizedEntity]):
-        """Add normalized entities as nodes to the graph"""
+        """Add normalized entities as nodes to the knowledge graph"""
         for entity in entities:
             self.add_node(entity)
 
@@ -49,7 +253,7 @@ class KnowledgeGraph:
         )
 
         self.nodes[node_id] = node
-        self.graph.add_node(node_id, **node.model_dump())
+        self.graph.add_node(node_id, **node.dict())
         logger.debug(f"Added node {node_id} for entity {entity.canonical_id}")
 
     def add_relationship(self, source_entity_id: str, target_entity_id: str, 
@@ -322,7 +526,7 @@ Return JSON: {{"relationships": [{{"type": "...", "strength": 0.0-1.0}}]}}"""
         ]
 
         return {
-            "center": center_node.model_dump() if center_node else None,
-            "nodes": [n.model_dump() for n in subgraph_nodes if n],
-            "edges": [e.model_dump() for e in subgraph_edges]
+            "center": center_node.dict() if center_node else None,
+            "nodes": [n.dict() for n in subgraph_nodes if n],
+            "edges": [e.dict() for e in subgraph_edges]
         }

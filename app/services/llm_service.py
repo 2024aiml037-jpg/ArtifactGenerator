@@ -76,6 +76,8 @@ class LLMService:
                 response = self.chain({"question": query})
                 return response['answer']
             else:
+                print("Retrieval chain not initialized, using direct LLM response")
+                print(f"Query: {query}")
                 return self.llm.predict(input=query)
         except Exception as e:
             logger.error(f"Error getting LLM response: {e}")
@@ -92,7 +94,9 @@ class LLMService:
             LLM response with extracted entities
         """
         try:
+            print(f"Invoking extraction with prompt:\n{prompt}\n{'='*50}")
             response = self.extraction_llm.predict(input=prompt)
+            print(f"Extraction response:\n{response}\n{'='*50}")
             logger.debug(f"Extraction completed. Response length: {len(response)}")
             return response
         except Exception as e:
@@ -124,7 +128,9 @@ Generate a professional requirements document with:
 Format as markdown."""
 
         try:
+            print(f"Generating requirements document with prompt:\n{prompt}\n{'='*50}")
             response = self.generation_llm.predict(input=prompt)
+            print(f"Generated requirements document:\n{response}\n{'='*50}")
             logger.info("Generated requirements document")
             return response
         except Exception as e:
@@ -157,7 +163,9 @@ Generate a professional design document with:
 Format as markdown."""
 
         try:
+            print(f"Generating design document with prompt:\n{prompt}\n{'='*50}")
             response = self.generation_llm.predict(input=prompt)
+            print(f"Generated design document:\n{response}\n{'='*50}")
             logger.info("Generated design document")
             return response
         except Exception as e:
@@ -188,7 +196,9 @@ Generate test cases organized by:
 For each test case include: ID, Name, Description, Preconditions, Steps, Expected Result."""
 
         try:
+            print(f"Generating test cases with prompt:\n{prompt}\n{'='*50}")
             response = self.generation_llm.predict(input=prompt)
+            print(f"Generated test cases:\n{response}\n{'='*50}")
             logger.info("Generated test cases")
             return response
         except Exception as e:
@@ -220,7 +230,9 @@ Generate a professional business rules document with:
 Format as markdown."""
 
         try:
+            print(f"Generating business rules document with prompt:\n{prompt}\n{'='*50}")
             response = self.generation_llm.predict(input=prompt)
+            print(f"Generated business rules document:\n{response}\n{'='*50}")
             logger.info("Generated business rules document")
             return response
         except Exception as e:
@@ -246,7 +258,9 @@ Statement 2: {text2}
 Answer with only: CONSISTENT or CONTRADICTORY"""
 
         try:
+            print(f"Validating consistency with prompt:\n{prompt}\n{'='*50}")
             response = self.extraction_llm.predict(input=prompt)
+            print(f"Consistency validation response:\n{response}\n{'='*50}")
             return "CONSISTENT" in response.upper()
         except Exception as e:
             logger.warning(f"Consistency validation error: {e}")
@@ -263,7 +277,9 @@ Answer with only: CONSISTENT or CONTRADICTORY"""
             Validation response
         """
         try:
+            print(f"Invoking validation with prompt:\n{prompt}\n{'='*50}")
             response = self.extraction_llm.predict(input=prompt)
+            print(f"Validation response:\n{response}\n{'='*50}")
             return response
         except Exception as e:
             logger.error(f"Validation error: {e}")
@@ -292,7 +308,9 @@ Provide suggestions for:
 List each suggestion as a numbered item."""
 
         try:
+            print(f"Generating improvement suggestions with prompt:\n{prompt}\n{'='*50}")
             response = self.generation_llm.predict(input=prompt)
+            print(f"Improvement suggestions response:\n{response}\n{'='*50}")
             # Parse response into list
             suggestions = [line.strip() for line in response.split('\n') if line.strip() and any(char.isdigit() for char in line[:3])]
             logger.info(f"Generated {len(suggestions)} improvement suggestions")
