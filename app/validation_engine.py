@@ -51,10 +51,12 @@ class ValidationEngine:
         if knowledge_graph_edges:
             conflicts.extend(self._validate_relationships(normalized_entities, knowledge_graph_edges))
 
-        # Calculate validation score
-        total_issues = len(conflicts) + len(gaps) + len(inconsistencies)
-        validation_score = max(0.0, 1.0 - (total_issues * 0.1))  # Decrease by 10% per issue
-        validation_score = min(1.0, validation_score)
+        # Calculate validation score with weighted penalties
+        # Conflicts are most severe, gaps are minor, inconsistencies are moderate
+        high_severity_conflicts = len([c for c in conflicts if c.severity == "high"])
+        other_conflicts = len(conflicts) - high_severity_conflicts
+        penalty = (high_severity_conflicts * 0.15) + (other_conflicts * 0.08) + (len(gaps) * 0.03) + (len(inconsistencies) * 0.05)
+        validation_score = max(0.0, min(1.0, 1.0 - penalty))
 
         is_valid = len([c for c in conflicts if c.severity == "high"]) == 0
 
@@ -98,11 +100,11 @@ class ValidationEngine:
 
         # Check for entities without descriptions
         for entity in entities:
-            # Skip if it's marked as incomplete
-            if len(entity.canonical_text) < 10:
+            # Only flag truly empty or trivially short descriptions
+            if len(entity.canonical_text.strip()) < 5:
                 gaps.append(f"Entity '{entity.canonical_id}' has very short description (possible incomplete extraction)")
 
-        # Check for isolated entities
+        # Check for isolated entities — only flag if majority are isolated
         entities_with_relations = set()
         for entity in entities:
             if entity.unified_attributes.get('related_entities'):
@@ -111,7 +113,7 @@ class ValidationEngine:
         isolated = [e.canonical_id for e in entities if e.canonical_id not in entities_with_relations 
                    and e.entity_type not in [EntityType.DESIGN, EntityType.API]]
         
-        if isolated:
+        if isolated and len(isolated) > len(entities) * 0.5:
             gaps.append(f"Found {len(isolated)} isolated entities without relationships")
 
         return gaps
@@ -194,9 +196,11 @@ class ValidationEngine:
 
         for positive, negative in contradictory_pairs:
             if positive in text1_lower and negative in text2_lower:
-                # Check if they refer to the same thing
-                shared_words = set(text1_lower.split()) & set(text2_lower.split())
-                if len(shared_words) > 2:  # More than 2 common words
+                # Check if they refer to the same thing — require strong overlap
+                words1 = set(text1_lower.split()) - {"the", "a", "an", "is", "are", "to", "and", "or", "of", "in", "for", "with", "be", "shall", "should", "will"}
+                words2 = set(text2_lower.split()) - {"the", "a", "an", "is", "are", "to", "and", "or", "of", "in", "for", "with", "be", "shall", "should", "will"}
+                shared_words = words1 & words2
+                if len(shared_words) > 3:  # Require 4+ meaningful shared words
                     return True
 
         # Use LLM for semantic contradiction if available

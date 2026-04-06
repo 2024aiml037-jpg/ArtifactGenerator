@@ -318,7 +318,7 @@ if st.button("🚀 Start Ingestion", key="ingest_btn", type="primary"):
                 f"{FLASK_API_URL}/api/ingest",
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=300,
+                timeout=600,
             )
             data = resp.json()
             if resp.ok:
@@ -538,7 +538,7 @@ with gen_col1:
     if st.button("Generate Requirements", key="gen_req_btn"):
         with st.spinner("Generating requirements document..."):
             try:
-                resp = requests.post(f"{FLASK_API_URL}/api/generate/requirements", timeout=300)
+                resp = requests.post(f"{FLASK_API_URL}/api/generate/requirements", timeout=600)
                 data = resp.json()
                 if resp.ok:
                     st.session_state.generated_doc = data
@@ -553,7 +553,7 @@ with gen_col2:
     if st.button("Generate Design", key="gen_design_btn"):
         with st.spinner("Generating design document..."):
             try:
-                resp = requests.post(f"{FLASK_API_URL}/api/generate/design", timeout=300)
+                resp = requests.post(f"{FLASK_API_URL}/api/generate/design", timeout=600)
                 data = resp.json()
                 if resp.ok:
                     st.session_state.generated_doc = data
@@ -568,7 +568,7 @@ with gen_col3:
     if st.button("Generate Rules", key="gen_rules_btn"):
         with st.spinner("Generating business rules document..."):
             try:
-                resp = requests.post(f"{FLASK_API_URL}/api/generate/rules", timeout=300)
+                resp = requests.post(f"{FLASK_API_URL}/api/generate/rules", timeout=600)
                 data = resp.json()
                 if resp.ok:
                     st.session_state.generated_doc = data
@@ -874,7 +874,7 @@ with st.sidebar:
     if st.button("Run Full Pipeline"):
         with st.spinner("Running pipeline..."):
             try:
-                resp = requests.post(f"{FLASK_API_URL}/api/pipeline/run", timeout=300)
+                resp = requests.post(f"{FLASK_API_URL}/api/pipeline/run", timeout=600)
                 data = resp.json()
                 if resp.ok:
                     st.success("Pipeline completed")

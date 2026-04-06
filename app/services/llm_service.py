@@ -25,23 +25,26 @@ class LLMService:
             vector_store: VectorStore instance for retrieval
         """
         self.llm = ChatOpenAI(
-            temperature=0.7,
+            temperature=0.2,
             model_name="gpt-3.5-turbo",
-            openai_api_key=Config.OPENAI_API_KEY
+            openai_api_key=Config.OPENAI_API_KEY,
+            max_tokens=4096
         )
         
         # For structured extraction (lower temperature)
         self.extraction_llm = ChatOpenAI(
             temperature=0.2,
             model_name="gpt-3.5-turbo",
-            openai_api_key=Config.OPENAI_API_KEY
+            openai_api_key=Config.OPENAI_API_KEY,
+            max_tokens=4096
         )
         
         # For generation (higher temperature for creativity)
         self.generation_llm = ChatOpenAI(
             temperature=0.8,
             model_name="gpt-3.5-turbo",
-            openai_api_key=Config.OPENAI_API_KEY
+            openai_api_key=Config.OPENAI_API_KEY,
+            max_tokens=4096
         )
         
         self.memory = ConversationBufferMemory(
