@@ -1,0 +1,41 @@
+{
+  "header": {
+    "requestId": "REQ-20260404-CI33333333",
+    "channel": "DIGITAL",
+    "productCode": "PL",
+    "requestTimestamp": "2026-04-05T18:15:00Z"
+  },
+  "applicant": {
+    "customerId": "CI33333333",
+    "customerType": "INDIVIDUAL",
+    "name": {
+      "firstName": "Test Refer FN",
+      "lastName": "Test Refer LN"
+    },
+    "dateOfBirth": "1988-05-20",
+    "ssn": "XXX-XX-5678",
+    "address": {
+      "line1": "45 Residency Road",
+      "city": "Patna",
+      "state": "KA",
+      "postalCode": "560025",
+      "country": "IN"
+    }
+  },
+  "application": {
+    "applicationId": "APP-123456789",
+    "requestedAmount": 300000,
+    "tenureMonths": 24,
+    "purpose": "PERSONAL LOAN",
+    "submissionType": "APPLICATION"
+  },
+  "financials": {
+    "annualIncome": 900000,
+    "existingObligations": 150000,
+    "employmentType": "SALARIED"
+  },
+  "bureauData": {
+    "bureauScore": 630,
+    "bureauProvider": "CIBIL"
+  }
+}

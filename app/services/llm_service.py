@@ -61,6 +61,16 @@ class LLMService:
             logger.warning(f"Failed to initialize retrieval chain: {e}")
             self.chain = None
 
+    def _invoke_model(self, model, prompt: str) -> str:
+        """Invoke a chat model across LangChain API variants and normalize the text response."""
+        try:
+            return model.predict(prompt)
+        except (AttributeError, TypeError):
+            response = model.invoke(prompt)
+            if hasattr(response, "content"):
+                return response.content
+            return str(response)
+
     def get_response(self, query: str) -> str:
         """
         Get response to a query (backward compatible)
@@ -78,7 +88,7 @@ class LLMService:
             else:
                 print("Retrieval chain not initialized, using direct LLM response")
                 print(f"Query: {query}")
-                return self.llm.predict(input=query)
+                return self._invoke_model(self.llm, query)
         except Exception as e:
             logger.error(f"Error getting LLM response: {e}")
             return "I encountered an error processing your request."
@@ -95,7 +105,7 @@ class LLMService:
         """
         try:
             print(f"Invoking extraction with prompt:\n{prompt}\n{'='*50}")
-            response = self.extraction_llm.predict(input=prompt)
+            response = self._invoke_model(self.extraction_llm, prompt)
             print(f"Extraction response:\n{response}\n{'='*50}")
             logger.debug(f"Extraction completed. Response length: {len(response)}")
             return response
@@ -129,7 +139,7 @@ Format as markdown."""
 
         try:
             print(f"Generating requirements document with prompt:\n{prompt}\n{'='*50}")
-            response = self.generation_llm.predict(input=prompt)
+            response = self._invoke_model(self.generation_llm, prompt)
             print(f"Generated requirements document:\n{response}\n{'='*50}")
             logger.info("Generated requirements document")
             return response
@@ -164,7 +174,7 @@ Format as markdown."""
 
         try:
             print(f"Generating design document with prompt:\n{prompt}\n{'='*50}")
-            response = self.generation_llm.predict(input=prompt)
+            response = self._invoke_model(self.generation_llm, prompt)
             print(f"Generated design document:\n{response}\n{'='*50}")
             logger.info("Generated design document")
             return response
@@ -197,7 +207,7 @@ For each test case include: ID, Name, Description, Preconditions, Steps, Expecte
 
         try:
             print(f"Generating test cases with prompt:\n{prompt}\n{'='*50}")
-            response = self.generation_llm.predict(input=prompt)
+            response = self._invoke_model(self.generation_llm, prompt)
             print(f"Generated test cases:\n{response}\n{'='*50}")
             logger.info("Generated test cases")
             return response
@@ -231,7 +241,7 @@ Format as markdown."""
 
         try:
             print(f"Generating business rules document with prompt:\n{prompt}\n{'='*50}")
-            response = self.generation_llm.predict(input=prompt)
+            response = self._invoke_model(self.generation_llm, prompt)
             print(f"Generated business rules document:\n{response}\n{'='*50}")
             logger.info("Generated business rules document")
             return response
@@ -259,7 +269,7 @@ Answer with only: CONSISTENT or CONTRADICTORY"""
 
         try:
             print(f"Validating consistency with prompt:\n{prompt}\n{'='*50}")
-            response = self.extraction_llm.predict(input=prompt)
+            response = self._invoke_model(self.extraction_llm, prompt)
             print(f"Consistency validation response:\n{response}\n{'='*50}")
             return "CONSISTENT" in response.upper()
         except Exception as e:
@@ -278,7 +288,7 @@ Answer with only: CONSISTENT or CONTRADICTORY"""
         """
         try:
             print(f"Invoking validation with prompt:\n{prompt}\n{'='*50}")
-            response = self.extraction_llm.predict(input=prompt)
+            response = self._invoke_model(self.extraction_llm, prompt)
             print(f"Validation response:\n{response}\n{'='*50}")
             return response
         except Exception as e:
@@ -309,7 +319,7 @@ List each suggestion as a numbered item."""
 
         try:
             print(f"Generating improvement suggestions with prompt:\n{prompt}\n{'='*50}")
-            response = self.generation_llm.predict(input=prompt)
+            response = self._invoke_model(self.generation_llm, prompt)
             print(f"Improvement suggestions response:\n{response}\n{'='*50}")
             # Parse response into list
             suggestions = [line.strip() for line in response.split('\n') if line.strip() and any(char.isdigit() for char in line[:3])]

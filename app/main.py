@@ -4,6 +4,7 @@ Orchestrates all layers: Ingestion, Extraction, Normalization, Validation, Knowl
 """
 
 import os
+import json
 import logging
 from datetime import datetime
 
@@ -11,7 +12,7 @@ from flask import Flask, request, render_template, jsonify
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from models.vector_store import VectorStore
-from services.storage_service import S3Storage
+from services.storage_service import get_storage_service
 from services.llm_service import LLMService
 from config import Config
 from ingestion_layer import IngestionLayer
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize core services
 vector_store = VectorStore(Config.VECTOR_DB_PATH)
-storage_service = S3Storage()
+storage_service = get_storage_service()
 llm_service = LLMService(vector_store)
 
 # Initialize knowledge platform layers
@@ -103,19 +104,30 @@ def get_status():
     })
 
 
+@app.route('/api/storage/config', methods=['GET'])
+def storage_config():
+    """Return the current storage backend configuration."""
+    return jsonify({
+        'storage_backend': Config.STORAGE_BACKEND,
+        'local_upload_dir': os.path.abspath(Config.LOCAL_UPLOAD_DIR),
+        'aws_bucket': Config.AWS_BUCKET_NAME or '',
+        'aws_region': Config.AWS_REGION,
+    })
+
+
 # ==================== Ingestion Routes ====================
 
 @app.route('/upload', methods=['POST'])
 def upload_document():
-    """Upload and ingest a document"""
+    """STEP 1: Upload documents to local directory and/or S3 bucket only (no ingestion)."""
     try:
         with observability.track_operation("document_upload"):
             logger.debug("Upload endpoint called")
-            
+
             if 'file' not in request.files:
                 logger.warning("No file in request")
                 return jsonify({'error': 'No file provided'}), 400
-            
+
             file = request.files['file']
             if file.filename == '':
                 logger.warning("Empty filename")
@@ -124,83 +136,313 @@ def upload_document():
             # Validate file extension
             supported_exts = {'.txt', '.pdf', '.docx', '.json', '.xlsx'}
             file_ext = os.path.splitext(file.filename)[1].lower()
-            
+
             if file_ext not in supported_exts:
                 logger.warning(f"Unsupported file type: {file.filename}")
                 return jsonify({'error': f'Only {supported_exts} files are supported'}), 400
 
-            logger.debug(f"Processing file: {file.filename}")
-            
-            # STEP 1: Ingestion
-            if not Config.ENABLE_INGESTION_LAYER:
-                return jsonify({'error': 'Ingestion layer is disabled'}), 503
-            
-            ingested_doc = ingestion_layer.ingest_from_file_object(
-                file, file.filename
-            )
-            
-            pipeline_state['current_document_id'] = ingested_doc.document_id
-            
-            # Upload to S3
-            file.seek(0)
-            storage_service.upload_file(file, file.filename)
-            logger.debug("File uploaded to S3")
-            
-            # Store ingested document for pipeline
-            pipeline_state['ingested_document'] = ingested_doc
-            
-            # Route storage by file type:
-            # JSON files -> Knowledge Graph DB
-            # Other files -> Vector Store
-            stored_in = None
-            if file_ext == '.json':
-                # Store JSON in Knowledge Graph
-                if knowledge_graph:
-                    import json as json_mod
-                    file.seek(0)
-                    json_data = json_mod.loads(file.read().decode('utf-8'))
-                    kg_result = knowledge_graph.ingest_json_document(
-                        doc_id=ingested_doc.document_id,
-                        filename=file.filename,
-                        data=json_data
-                    )
-                    stored_in = 'knowledge_graph'
-                    logger.debug(f"JSON document stored in Knowledge Graph: {kg_result['total_nodes']} nodes")
-                else:
-                    # Fallback to vector store if KG is disabled
-                    vector_store.add_text_chunks(ingested_doc.chunks)
-                    stored_in = 'vector_store'
-            else:
-                # Non-JSON files -> Vector Store
-                vector_store.add_text_chunks(ingested_doc.chunks)
-                stored_in = 'vector_store'
-                logger.debug("Document chunks added to vector store")
-            
-            observability.record_ingestion(
-                source_type=str(ingested_doc.metadata.source),
-                duration=0.0,
-                document_count=len(ingested_doc.chunks)
-            )
-            
-            # Return structured JSON metadata
+            logger.debug(f"Storing file: {file.filename}")
+
+            # Store file to configured storage backend only
+            req_backend = request.form.get('storage_backend') or Config.STORAGE_BACKEND
+            req_local_dir = request.form.get('local_dir') or None
+            upload_storage = get_storage_service(backend=req_backend, local_dir=req_local_dir)
+            upload_storage.upload_file(file, file.filename)
+            logger.info(f"File stored via {req_backend} backend: {file.filename}")
+
             return jsonify({
-                'message': 'Document ingested successfully',
-                'document_id': ingested_doc.document_id,
-                'chunks_processed': len(ingested_doc.chunks),
-                'stored_in': stored_in,
-                'metadata': {
-                    'source': ingested_doc.metadata.source.value,
-                    'filename': ingested_doc.metadata.filename,
-                    'version': ingested_doc.metadata.version,
-                    'timestamp': ingested_doc.metadata.timestamp.isoformat()
-                },
-                'content_preview': ingested_doc.content[:500],
-                'next_step': '/api/extract'
+                'message': f'File stored successfully via {req_backend}',
+                'filename': file.filename,
+                'storage_backend': req_backend,
+                'storage_dir': os.path.abspath(req_local_dir or Config.LOCAL_UPLOAD_DIR) if req_backend == 'local' else Config.AWS_BUCKET_NAME,
+                'next_step': '/api/ingest'
             }), 200
 
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
         return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+
+@app.route('/api/ingest', methods=['POST'])
+def ingest_documents():
+    """
+    STEP 2-6 Pipeline: Ingestion → AI Extraction → Normalization → Vector Store / Knowledge Graph
+
+    STEP 2: INGESTION        – Convert all sources into structured JSON with metadata
+    STEP 3: AI EXTRACTION    – Extract requirements, rules, entities using LLMs
+    STEP 4: NORMALIZATION    – Remove duplicates using embeddings & semantic similarity
+    STEP 5: VECTOR STORE     – Store PDF, DOCX, TXT, XLSX files into Vector Store
+    STEP 6: KNOWLEDGE GRAPH  – Store JSON files; build relationships Requirement → Rule → Code → API → DB
+    """
+    try:
+        with observability.track_operation("ingest_pipeline"):
+            data = request.json or {}
+            storage_backend = data.get('storage_backend') or Config.STORAGE_BACKEND
+            local_dir = data.get('local_dir') or Config.LOCAL_UPLOAD_DIR
+
+            # Resolve upload directory
+            if storage_backend == 'local':
+                upload_dir = os.path.abspath(local_dir)
+            else:
+                upload_dir = None  # S3 — files fetched via storage service
+
+            if not Config.ENABLE_INGESTION_LAYER:
+                return jsonify({'error': 'Ingestion layer is disabled'}), 503
+
+            # Collect files from storage
+            store = get_storage_service(backend=storage_backend, local_dir=local_dir)
+            file_list = store.list_files()
+            if not file_list:
+                return jsonify({'error': 'No files found in storage to ingest'}), 400
+
+            supported_exts = {'.txt', '.pdf', '.docx', '.json', '.xlsx'}
+            files_to_process = [f for f in file_list if os.path.splitext(f)[1].lower() in supported_exts]
+            if not files_to_process:
+                return jsonify({'error': 'No supported files found in storage'}), 400
+
+            results = {
+                'step2_ingestion': [],
+                'step3_extraction': {},
+                'step4_normalization': {},
+                'step5_vector_store': [],
+                'step6_knowledge_graph': [],
+                'step7_validation': {},
+                'step8_traceability': {},
+            }
+
+            ingested_docs = []
+            all_chunks = []
+
+            # ===== STEP 2: INGESTION — Convert sources into structured JSON with metadata =====
+            logger.info(f"STEP 2: Ingesting {len(files_to_process)} files")
+            for filename in files_to_process:
+                try:
+                    if storage_backend == 'local':
+                        file_path = os.path.join(upload_dir, filename)
+                        ingested_doc = ingestion_layer.ingest_file(file_path)
+                    else:
+                        # S3: download to temp, ingest, clean up
+                        import tempfile
+                        file_obj = store.get_file(filename)
+                        if file_obj is None:
+                            logger.warning(f"Could not retrieve {filename} from S3")
+                            continue
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
+                        tmp.write(file_obj.read())
+                        tmp.close()
+                        ingested_doc = ingestion_layer.ingest_file(tmp.name)
+                        os.unlink(tmp.name)
+
+                    ingested_docs.append(ingested_doc)
+                    all_chunks.extend(ingested_doc.chunks)
+
+                    observability.record_ingestion(
+                        source_type=str(ingested_doc.metadata.source),
+                        duration=0.0,
+                        document_count=len(ingested_doc.chunks)
+                    )
+
+                    results['step2_ingestion'].append({
+                        'document_id': ingested_doc.document_id,
+                        'filename': ingested_doc.metadata.filename,
+                        'source_type': ingested_doc.metadata.source.value,
+                        'chunks': len(ingested_doc.chunks),
+                    })
+                except Exception as e:
+                    logger.error(f"Ingestion failed for {filename}: {e}")
+                    results['step2_ingestion'].append({
+                        'filename': filename,
+                        'error': str(e),
+                    })
+
+            if not ingested_docs:
+                return jsonify({'error': 'All files failed ingestion', 'details': results['step2_ingestion']}), 500
+
+            # Build combined document for pipeline state
+            combined_content = "\n\n".join(doc.content for doc in ingested_docs)
+            from models.schemas import IngestedDocument as IngestedDocModel, Metadata as MetadataModel, SourceType as SourceTypeEnum
+            combined_doc = IngestedDocModel(
+                document_id=f"ingest_{int(datetime.utcnow().timestamp())}",
+                content=combined_content,
+                metadata=MetadataModel(
+                    source=SourceTypeEnum.API,
+                    filename="CombinedIngestion",
+                    timestamp=datetime.utcnow(),
+                    tags=["batch_ingest"]
+                ),
+                chunks=all_chunks,
+            )
+            pipeline_state['current_document_id'] = combined_doc.document_id
+            pipeline_state['ingested_document'] = combined_doc
+
+            # ===== STEP 3: AI EXTRACTION — Extract requirements, rules, entities using LLMs =====
+            if Config.ENABLE_EXTRACTION_LAYER and extraction_layer:
+                logger.info("STEP 3: AI Extraction")
+                extraction_result = extraction_layer.extract_all_entities(combined_doc)
+                pipeline_state['extraction_result'] = extraction_result
+
+                entities_by_type = {}
+                for entity in extraction_result.extracted_entities:
+                    etype = entity.type.value
+                    entities_by_type.setdefault(etype, 0)
+                    entities_by_type[etype] += 1
+
+                results['step3_extraction'] = {
+                    'total_entities': len(extraction_result.extracted_entities),
+                    'entities_by_type': entities_by_type,
+                    'errors': extraction_result.errors,
+                    'warnings': extraction_result.warnings,
+                }
+            else:
+                logger.warning("Extraction layer disabled — skipping STEP 3")
+
+            # ===== STEP 4: NORMALIZATION — Remove duplicates using embeddings & semantic similarity =====
+            if Config.ENABLE_NORMALIZATION and normalization_engine and pipeline_state.get('extraction_result'):
+                logger.info("STEP 4: Normalization")
+                extraction_result = pipeline_state['extraction_result']
+                normalization_result = normalization_engine.normalize(extraction_result.extracted_entities)
+                pipeline_state['normalization_result'] = normalization_result
+
+                results['step4_normalization'] = {
+                    'total_normalized': len(normalization_result.normalized_entities),
+                    'duplicates_removed': normalization_result.duplicates_removed,
+                    'merges_performed': normalization_result.merges_performed,
+                }
+            else:
+                logger.warning("Normalization disabled or no entities — skipping STEP 4")
+
+            # ===== STEP 5: VECTOR STORE — PDF, DOCX, TXT, XLSX into Vector Store =====
+            logger.info("STEP 5: Routing non-JSON files to Vector Store")
+            for doc in ingested_docs:
+                file_ext = os.path.splitext(doc.metadata.filename or '')[1].lower()
+                if file_ext != '.json':
+                    vector_store.add_text_chunks(
+                        doc.chunks,
+                        metadatas=[{'source': doc.metadata.filename, 'document_id': doc.document_id} for _ in doc.chunks]
+                    )
+                    results['step5_vector_store'].append({
+                        'filename': doc.metadata.filename,
+                        'chunks_stored': len(doc.chunks),
+                    })
+                    logger.info(f"  → {doc.metadata.filename} stored in Vector Store ({len(doc.chunks)} chunks)")
+
+            # Also add normalized entities to vector store if available
+            normalization_result = pipeline_state.get('normalization_result')
+            if normalization_result:
+                vector_store.add_normalized_entities(normalization_result.normalized_entities)
+
+            # ===== STEP 6: KNOWLEDGE GRAPH — JSON files + build relationships =====
+            logger.info("STEP 6: Routing JSON files to Knowledge Graph & building relationships")
+            if Config.ENABLE_KNOWLEDGE_GRAPH and knowledge_graph:
+                for doc in ingested_docs:
+                    file_ext = os.path.splitext(doc.metadata.filename or '')[1].lower()
+                    if file_ext == '.json':
+                        # Re-read JSON data from storage
+                        try:
+                            if storage_backend == 'local':
+                                json_path = os.path.join(upload_dir, doc.metadata.filename)
+                                with open(json_path, 'r') as jf:
+                                    json_data = json.load(jf)
+                            else:
+                                file_obj = store.get_file(doc.metadata.filename)
+                                json_data = json.loads(file_obj.read())
+
+                            kg_result = knowledge_graph.ingest_json_document(
+                                doc_id=doc.document_id,
+                                filename=doc.metadata.filename,
+                                data=json_data,
+                                metadata={'source': doc.metadata.filename, 'document_id': doc.document_id}
+                            )
+                            results['step6_knowledge_graph'].append({
+                                'filename': doc.metadata.filename,
+                                'total_nodes': kg_result['total_nodes'],
+                            })
+                            logger.info(f"  → {doc.metadata.filename} stored in Knowledge Graph ({kg_result['total_nodes']} nodes)")
+                        except Exception as e:
+                            logger.error(f"KG ingestion failed for {doc.metadata.filename}: {e}")
+                            results['step6_knowledge_graph'].append({
+                                'filename': doc.metadata.filename,
+                                'error': str(e),
+                            })
+
+                # Build relationships from normalized entities if available
+                if normalization_result and normalization_result.normalized_entities:
+                    knowledge_graph.add_entities(normalization_result.normalized_entities)
+                    knowledge_graph.auto_discover_relationships(
+                        normalization_result.normalized_entities,
+                        llm_service=llm_service if Config.AUTO_DISCOVER_RELATIONSHIPS else None
+                    )
+                    pipeline_state['knowledge_graph_built'] = True
+                    results['step6_knowledge_graph'].append({
+                        'relationships': knowledge_graph.get_statistics(),
+                    })
+            else:
+                logger.warning("Knowledge Graph disabled — JSON files stored in Vector Store as fallback")
+                for doc in ingested_docs:
+                    file_ext = os.path.splitext(doc.metadata.filename or '')[1].lower()
+                    if file_ext == '.json':
+                        vector_store.add_text_chunks(
+                            doc.chunks,
+                            metadatas=[{'source': doc.metadata.filename, 'document_id': doc.document_id} for _ in doc.chunks]
+                        )
+                        results['step5_vector_store'].append({
+                            'filename': doc.metadata.filename,
+                            'chunks_stored': len(doc.chunks),
+                            'note': 'JSON stored in Vector Store (KG disabled)'
+                        })
+
+            # ===== STEP 7: VALIDATION — Detect conflicts, gaps, inconsistencies =====
+            normalization_result = pipeline_state.get('normalization_result')
+            if Config.ENABLE_VALIDATION and validation_engine and normalization_result and normalization_result.normalized_entities:
+                logger.info("STEP 7: Validation")
+                kg_edges = None
+                if knowledge_graph and pipeline_state.get('knowledge_graph_built'):
+                    kg_edges = [e.dict() for e in knowledge_graph.edges.values()]
+                validation_result = validation_engine.validate(
+                    normalization_result.normalized_entities,
+                    knowledge_graph_edges=kg_edges
+                )
+                pipeline_state['validation_result'] = validation_result
+                results['step7_validation'] = {
+                    'is_valid': validation_result.is_valid,
+                    'validation_score': validation_result.validation_score,
+                    'conflicts': len(validation_result.conflicts),
+                    'gaps': len(validation_result.gaps),
+                    'inconsistencies': len(validation_result.inconsistencies),
+                }
+            else:
+                logger.warning("Validation skipped — disabled or no entities")
+
+            # ===== STEP 8: TRACEABILITY — Attach source, confidence score, version =====
+            if normalization_result and normalization_result.normalized_entities:
+                logger.info("STEP 8: Traceability summary")
+                trace_summary = []
+                for entity in normalization_result.normalized_entities:
+                    for trace in entity.traceability:
+                        trace_summary.append({
+                            'entity_id': entity.canonical_id,
+                            'entity_type': entity.entity_type.value,
+                            'source': trace.source_id,
+                            'confidence': trace.confidence_score,
+                            'confidence_level': trace.confidence_level.value,
+                            'version': trace.source_metadata.version,
+                        })
+                confidence_scores = [t['confidence'] for t in trace_summary]
+                results['step8_traceability'] = {
+                    'total_traces': len(trace_summary),
+                    'average_confidence': round(sum(confidence_scores) / max(1, len(confidence_scores)), 3),
+                }
+
+            return jsonify({
+                'message': f'Ingestion pipeline completed for {len(ingested_docs)} files',
+                'pipeline_steps': results,
+                'combined_document_id': combined_doc.document_id,
+                'next_steps': ['/api/validate', '/api/generate/requirements', '/api/generate/design'],
+            }), 200
+
+    except Exception as e:
+        logger.error(f"Ingest pipeline error: {str(e)}")
+        return jsonify({'error': f'Ingestion pipeline failed: {str(e)}'}), 500
 
 
 @app.route('/api/ingest/sample-data', methods=['POST'])
@@ -246,9 +488,8 @@ def ingest_sample_data():
                 
                 # Route by file type: JSON -> Knowledge Graph, Others -> Vector Store
                 if file_ext == '.json' and knowledge_graph:
-                    import json as json_mod
                     with open(file_path, 'r') as jf:
-                        json_data = json_mod.load(jf)
+                        json_data = json.load(jf)
                     kg_result = knowledge_graph.ingest_json_document(
                         doc_id=ingested_doc.document_id,
                         filename=filename,
@@ -1038,6 +1279,51 @@ def submit_feedback():
 
 
 # ==================== Observability Routes ====================
+
+@app.route('/api/traceability', methods=['GET'])
+def get_traceability():
+    """STEP 8: Get traceability information — source, confidence score, version for all entities"""
+    try:
+        normalization_result = pipeline_state.get('normalization_result')
+        if not normalization_result or not normalization_result.normalized_entities:
+            return jsonify({'error': 'No normalized entities. Run the ingestion pipeline first.'}), 400
+
+        traces = []
+        for entity in normalization_result.normalized_entities:
+            for trace in entity.traceability:
+                traces.append({
+                    'entity_id': entity.canonical_id,
+                    'entity_type': entity.entity_type.value,
+                    'entity_text': entity.canonical_text[:200],
+                    'source': trace.source_id,
+                    'source_type': trace.source_metadata.source.value,
+                    'confidence_score': trace.confidence_score,
+                    'confidence_level': trace.confidence_level.value,
+                    'extraction_method': trace.extraction_method,
+                    'version': trace.source_metadata.version,
+                    'verified_by': trace.verified_by,
+                    'timestamp': trace.source_metadata.timestamp.isoformat() if trace.source_metadata.timestamp else None,
+                })
+
+        # Summary statistics
+        confidence_scores = [t['confidence_score'] for t in traces]
+        avg_confidence = sum(confidence_scores) / max(1, len(confidence_scores))
+        by_level = {}
+        for t in traces:
+            lvl = t['confidence_level']
+            by_level[lvl] = by_level.get(lvl, 0) + 1
+
+        return jsonify({
+            'total_traces': len(traces),
+            'average_confidence': round(avg_confidence, 3),
+            'confidence_distribution': by_level,
+            'traces': traces,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Traceability error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():

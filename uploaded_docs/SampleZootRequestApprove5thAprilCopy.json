@@ -1,0 +1,41 @@
+{
+  "header": {
+    "requestId": "REQ-20260404-CI11111111",
+    "channel": "DIGITAL",
+    "productCode": "PL",
+    "requestTimestamp": "2026-04-05T18:15:00Z"
+  },
+  "applicant": {
+    "customerId": "CI11111111",
+    "customerType": "INDIVIDUAL",
+    "name": {
+      "firstName": "Test Approved FN",
+      "lastName": "Test Approved LN"
+    },
+    "dateOfBirth": "1988-05-20",
+    "ssn": "XXX-XX-5678",
+    "address": {
+      "line1": "45 Residency Road",
+      "city": "Bengaluru",
+      "state": "KA",
+      "postalCode": "560025",
+      "country": "IN"
+    }
+  },
+  "application": {
+    "applicationId": "APP-123456789",
+    "requestedAmount": 300000,
+    "tenureMonths": 24,
+    "purpose": "PERSONAL LOAN",
+    "submissionType": "APPLICATION"
+  },
+  "financials": {
+    "annualIncome": 900000,
+    "existingObligations": 150000,
+    "employmentType": "SALARIED"
+  },
+  "bureauData": {
+    "bureauScore": 768,
+    "bureauProvider": "CIBIL"
+  }
+}

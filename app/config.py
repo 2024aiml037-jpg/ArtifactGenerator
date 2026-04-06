@@ -15,7 +15,11 @@ class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     
-    # AWS Configuration
+    # Storage Backend Configuration ("s3" or "local")
+    STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+    LOCAL_UPLOAD_DIR = os.getenv("LOCAL_UPLOAD_DIR", "uploaded_docs")
+    
+    # AWS Configuration (required only when STORAGE_BACKEND="s3")
     AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
     AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
     AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
@@ -73,7 +77,9 @@ class Config:
     @classmethod
     def validate(cls):
         """Validate required configuration"""
-        required = ['OPENAI_API_KEY', 'AWS_ACCESS_KEY', 'AWS_SECRET_KEY', 'AWS_BUCKET_NAME']
+        required = ['OPENAI_API_KEY']
+        if cls.STORAGE_BACKEND == 's3':
+            required += ['AWS_ACCESS_KEY', 'AWS_SECRET_KEY', 'AWS_BUCKET_NAME']
         missing = [field for field in required if not getattr(cls, field)]
         
         if missing:
